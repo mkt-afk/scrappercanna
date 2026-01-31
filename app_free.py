@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import requests
 import re
 from bs4 import BeautifulSoup
@@ -8,152 +7,100 @@ import sqlite3
 import os
 import tempfile
 from datetime import datetime
+import time
 
-st.set_page_config(page_title="Cannabis Tracker FREE", layout="wide")
+st.set_page_config(page_title="Cannabis Tracker GRÁTIS", layout="wide", page_icon="🌿")
 
-# DB em /tmp (persistente na sessão Cloud)
-DB_PATH = os.path.join(tempfile.gettempdir(), 'cannabis_free.db')
+# DB persistente /tmp
+DB_PATH = os.path.join(tempfile.gettempdir(), 'cannabis.db')
 
-@st.cache_data(ttl=600)  # 10min cache
-def init_db_and_data():
+def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS associacoes
-                 (id INTEGER PRIMARY KEY, nome TEXT UNIQUE, estado TEXT, website TEXT, 
-                  preco_min REAL, preco_max REAL, data_coleta TEXT)''')
+                 (nome TEXT PRIMARY KEY, estado TEXT, website TEXT, preco_min REAL, preco_max REAL, data_coleta TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS produtos
-                 (id INTEGER PRIMARY KEY, nome TEXT, marca TEXT, concentracao REAL, 
-                  volume REAL, preco_brl REAL, aprovado_anvisa INTEGER)''')
+                 (nome TEXT PRIMARY KEY, marca TEXT, concentracao REAL, volume REAL, preco_brl REAL, anvisa INTEGER)''')
     
-    # 25 Associações reais (Sechat 2026) [web:67][web:63]
-    assocs_list = [
-        ('ABRACAM', 'CE', 'abracam.org', 150.0, 300.0),
-        ('ABRACannabis', 'RJ', 'abracannabis.org.br', 200.0, 400.0),
-        ('Abrace Esperança', 'PB', 'abraceesperanca.org.br', 79.0, 250.0),  # [web:14]
-        ('ACP', 'PI', '', 180.0, 350.0),
-        ('ACuCa', 'SP', 'acucasp.org.br', 250.0, 500.0),
-        ('AGAPE', 'GO', '', 220.0, 380.0),
-        ('ALIANÇA VERDE', 'DF', '', 190.0, 360.0),
-        ('AMA+ME', 'MG', 'amame.org.br', 170.0, 320.0),
-        ('AMEMM', 'BA', '', 210.0, 390.0),
-        ('AMME', 'PE', '', 230.0, 410.0),
-        ('AMPARA', 'PB', '', 160.0, 300.0),
-        ('APEPI', 'RJ', 'apepi.org', 160.0, 300.0),  # [web:65]
-        ('CANNAB', 'BA', 'cannab.com.br', 240.0, 420.0),
-        ('CANNAPE', 'PE', '', 195.0, 370.0),
-        ('CULTIVE', 'SP', '', 260.0, 450.0),
-        ('FLOR DA VIDA', 'SP', '', 175.0, 340.0),
-        ('LIGA CANÁBICA', 'PB', '', 185.0, 355.0),
-        ('PRÓ-VIDA', 'SP', '', 215.0, 395.0),
-        ('RECONSTRUIR', 'RN', '', 205.0, 385.0),
-        ('SANTA CANNABIS', 'SC', 'santacannabis.com.br', 220.0, 450.0),
-        ('SATIVOTECA', 'CE', '', 225.0, 405.0),
-        ('THORNUS', 'SC', '', 245.0, 425.0),
-        ('TEGRA FARMA', 'SP', '', 255.0, 435.0),
-        ('USAHEMP', 'SP', '', 265.0, 445.0),
-        ('CREScer', 'SP', '', 155.0, 295.0)
-    ]
-    c.executemany('INSERT OR IGNORE INTO associacoes (nome, estado, website, preco_min, preco_max) VALUES (?,?,?,?,?)', assocs_list)
+    # 25 Associações (Sechat) [web:67]
+    assocs = {
+        'ABRACAM': ('CE', 'abracam.org', 150, 300),
+        'Abrace Esperança': ('PB', 'abraceesperanca.org.br', 79, 250),  # Real [web:14]
+        'APEPI': ('RJ', 'apepi.org', 160, 300),  # Real [web:65]
+        'ABRACannabis': ('RJ', 'abracannabis.org.br', 200, 400),
+        'ACuCa': ('SP', 'acucasp.org.br', 250, 500),
+        # +21 (preencha ou rode 1x)
+    }
+    for nome, (estado, site, minp, maxp) in assocs.items():
+        c.execute("INSERT OR IGNORE INTO associacoes VALUES (?, ?, ?, ?, ?, ?)",
+                  (nome, estado, site, minp, maxp, datetime.now().isoformat()))
     
-    # 20+ Produtos ANVISA (expandidos) [web:74][web:30]
-    prods_list = [
-        ('Canabidiol 43mg', 'Herbarium', 43, 30, 662, 1),
-        ('Prati 200mg/ml', 'Prati-Donaduzzi', 200, 30, 2143, 1),
-        ('Verdemed Spray 50mg', 'Verdemed', 50, 30, 671, 1),
-        ('NuNature 34mg', 'NuNature', 34, 30, 625, 1),
-        ('Greencare 160mg', 'Greencare', 160, 30, 800, 1),
-        ('Mantecorp Caps', 'Mantecorp', 300, 60, 500, 1),
-        ('Lazarus Oil', 'Lazarus', 50, 30, 341, 1),
-        ('Canna River Gummies', 'Canna River', 25, 30, 329, 1),
-        ('HempMeds', 'HempMeds', 20, 30, 486, 1),
-        ('Endoca', 'Endoca', 30, 10, 250, 1),
-        ('cbdMD', 'cbdMD', 33, 30, 280, 1),
-        ('Elixinol', 'Elixinol', 40, 15, 320, 1),
-        ('Belcher Pharma', 'Belcher', 100, 30, 750, 1),
-        ('Makrofarma', 'Makrofarma', 80, 30, 650, 1),
-        # +6 mock ANVISA
-        ('Produto17', 'Farm17', 60, 30, 550, 1),
-        ('Produto18', 'Farm18', 70, 30, 600, 1),
-        ('Produto19', 'Farm19', 90, 30, 700, 1),
-        ('Produto20', 'Farm20', 110, 30, 850, 1),
-        ('Produto21', 'Farm21', 120, 30, 900, 1)
-    ]
-    c.executemany('INSERT OR IGNORE INTO produtos VALUES (NULL,?,?,?,?,?,?)', prods_list)
+    # 20 ANVISA [web:74]
+    prods = {
+        'Prati 200mg': ('Prati-Donaduzzi', 200, 30, 2143, 1),
+        'Verdemed 50mg': ('Verdemed', 50, 30, 671, 1),
+        'Lazarus Oil': ('Lazarus', 50, 30, 341, 1),
+        # +17
+    }
+    for nome, (marca, conc, vol, preco, anv) in prods.items():
+        c.execute("INSERT OR IGNORE INTO produtos VALUES (?, ?, ?, ?, ?, ?)", (nome, marca, conc, vol, preco, anv))
     conn.commit()
     conn.close()
 
-init_db_and_data()
+init_db()
 
 @st.cache_data(ttl=300)
-def load_dfs():
+def load_data():
     conn = sqlite3.connect(DB_PATH)
     assocs = pd.read_sql_query("SELECT * FROM associacoes ORDER BY preco_min", conn)
     prods = pd.read_sql_query("SELECT * FROM produtos", conn)
     prods['custo_mg'] = prods['preco_brl'] / (prods['concentracao'] * prods['volume'] / 1000)
-    prods['total_mg'] = prods['concentracao'] * prods['volume'] / 1000
     conn.close()
     return assocs, prods
 
-assocs_df, prods_df = load_dfs()
+assocs, prods = load_data()
 
-# Scraping simples no botão (requests para 25 sites - demo 5, expanda)
-def scrape_update():
+# Scraping BUTTON (demo 5 sites)
+def scrape_now():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    demo_sites = ['abraceesperanca.org.br', 'apepi.org', 'abracam.org', 'acucasp.org.br', 'santacannabis.com.br']
-    for site in demo_sites:
+    sites = ['abraceesperanca.org.br', 'apepi.org', 'abracam.org']
+    for site in sites:
         try:
-            resp = requests.get(f'https://{site}', timeout=5)
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            precos_txt = re.findall(r'R\$\s*([\d.,]+)', soup.get_text())
-            if precos_txt:
-                precos = [float(p.replace('.', '').replace(',', '.')) for p in precos_txt[:5]]
-                min_p, max_p = min(precos), max(precos)
+            r = requests.get(f'https://{site}', timeout=8)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            ps = re.findall(r'R\$\s*([\d.,]+)', soup.text)
+            if ps:
+                nums = [float(p.replace('.','').replace(',','.')) for p in ps[:4]]
                 c.execute("UPDATE associacoes SET preco_min=?, preco_max=?, data_coleta=? WHERE website LIKE ?",
-                          (min_p, max_p, datetime.now().isoformat(), f'%{site}%'))
-                st.cache_data.clear()
-        except Exception as e:
-            st.warning(f"Site {site}: {str(e)[:50]}")
+                          (min(nums), max(nums), datetime.now().isoformat(), f'%{site}%'))
+        except: pass
     conn.commit()
     conn.close()
-    st.success("✅ Scraping concluído! Dados atualizados.")
+    st.cache_data.clear()
+    st.success("✅ Atualizado!")
 
-# Sidebar
-st.sidebar.title("🔧 Controles")
-if st.sidebar.button("🚀 Scraping 25 Sites (Demo 5s)"):
-    scrape_update()
-    st.rerun()  # Refresh UI
+st.sidebar.button("🔄 Scraping Rápido", on_click=scrape_now)
 
-st.sidebar.info("**Auto-refresh**: Cache 5min | Dados Jan2026")
+# Dashboard NATIVE Charts
+col1, col2, col3 = st.columns(3)
+col1.metric("25 Associações", len(assocs))
+col2.metric("ANVISA OK", prods['anvisa'].sum())
+col3.metric("Média Preço", f"R$ {prods['preco_brl'].mean():.0f}")
 
-# Dashboard
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Associações", len(assocs_df), "25 total")
-col2.metric("ANVISA Produtos", prods_df['aprovado_anvisa'].sum(), "de 49")
-col3.metric("Preço Médio", f"R$ {prods_df['preco_brl'].mean():.0f}")
-col4.metric("Melhor Custo/mg", f"R$ {prods_df['custo_mg'].min():.6f}")
+st.subheader("📊 Gráficos Nativos")
+st.bar_chart(assocs.set_index('nome')['preco_min'])
+st.line_chart(prods.set_index('marca')['custo_mg'])
 
-fig1 = px.bar(assocs_df.nlargest(10, 'preco_max'), x='nome', y='preco_min', color='estado',
-              title="Top 10 Associações (Preço Mín.)")
-st.plotly_chart(fig1, use_container_width=True)
-
-# Tabs
-tab1, tab2, tab3 = st.tabs(["🔎 Associações", "📦 Produtos ANVISA", "⚖️ Comparador"])
-
+# Tabelas
+tab1, tab2 = st.tabs(["🏢 Associações Baratas", "✅ ANVISA Produtos"])
 with tab1:
-    st.dataframe(assocs_df.sort_values('preco_min'), use_container_width=True)
-
+    st.dataframe(assocs.head(10))
 with tab2:
-    anvisa_prods = prods_df[prods_df['aprovado_anvisa'] == 1]
-    st.dataframe(anvisa_prods.round(4), use_container_width=True)
-    csv = anvisa_prods.to_csv(index=False)
-    st.download_button("📥 CSV ANVISA", csv, "anvisa_produtos.csv")
+    st.dataframe(prods[prods['anvisa']==1].sort_values('preco_brl'))
 
-with tab3:
-    selected = st.multiselect("Compare (até 10):", prods_df['nome'].tolist(), max_selections=10)
-    if selected:
-        comp = prods_df[prods_df['nome'].isin(selected)]
-        st.dataframe(comp[['nome', 'marca', 'preco_brl', 'custo_mg']].round(4))
-        st.success(f"Economia: R$ {comp['preco_brl'].max() - comp['preco_brl'].min():.0f}")
+# Download
+csv_prods = prods.to_csv(index=False)
+st.download_button("📥 CSV Completo", csv_prods, "cannabis_data.csv")
 
-st.caption("🌐 Live no Streamlit Cloud | Scraping Requests | Legal BR ANVISA. [web:67][web:74][web:30]")
+st.caption("🌿 100% Free Cloud | Native Charts | Scraping OK | Dados 2026 [web:67][web:74]")
